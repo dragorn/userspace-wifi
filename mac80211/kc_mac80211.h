@@ -28,6 +28,8 @@
  * Received frames are delivered with a radiotap header built as mac80211 builds it, and
  * frames are injected with one, as on a Linux monitor interface. */
 
+#include <stdio.h>
+
 #include <net/mac80211.h>
 
 /* data holds a radiotap header followed by the 802.11 frame; valid only during the call */
@@ -63,6 +65,13 @@ void kc_mac80211_set_tx_status_cb(struct ieee80211_hw *hw, kc_mac80211_tx_status
 /* For chips which DMA the FCS after some frames but report a length without it; a valid
  * FCS found there is kept on the frame and flagged in radiotap */
 void kc_mac80211_set_rx_fcs_past_end(struct ieee80211_hw *hw);
+
+/* For drivers which present their channels as other channels, such as 802.11ah as 5GHz:
+ * writes how the registered channels map to the real ones */
+typedef void (*kc_mac80211_chanmap_cb_t)(struct ieee80211_hw *hw, FILE *out);
+void kc_mac80211_set_chanmap_cb(struct ieee80211_hw *hw, kc_mac80211_chanmap_cb_t cb);
+/* Writes nothing for a driver whose channels are real */
+void kc_mac80211_print_chanmap(struct ieee80211_hw *hw, FILE *out);
 
 /* Builds a chandef for a control channel, width and centre frequency (0 for 20 MHz) */
 int kc_mac80211_chandef(struct ieee80211_hw *hw, enum nl80211_band band, int channel,

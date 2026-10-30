@@ -307,13 +307,29 @@ struct firmware {
 };
 int request_firmware(const struct firmware **fw, const char *name, struct device *dev);
 #define request_firmware_direct request_firmware
-#define firmware_request_nowarn request_firmware
+int firmware_request_nowarn(const struct firmware **fw, const char *name, struct device *dev);
 /* Loads synchronously, then calls cont from the caller's context */
 int request_firmware_nowait(struct module *module, bool uevent, const char *name, struct device *dev,
         gfp_t gfp, void *context, void (*cont)(const struct firmware *fw, void *context));
 void release_firmware(const struct firmware *fw);
-/* Directories searched in order; set by the host program */
+/* Directories searched in order; set by the host program, and followed on Linux by the system
+ * firmware directories in the kernel's search order */
 void kc_firmware_set_paths(const char *const *paths, size_t n);
+enum kc_fw_dirs {
+    KC_FW_DIRS_ALL,
+    KC_FW_DIRS_HOST,
+    KC_FW_DIRS_SYSTEM,
+};
+size_t kc_firmware_get_paths(enum kc_fw_dirs which, const char *const **paths);
+/* Quietly, from only some of the directories, the first of several names found; each
+ * directory is searched for all the names before the next */
+int kc_firmware_request_in(const struct firmware **fw, const char *const *names, size_t num_names,
+        struct device *dev, enum kc_fw_dirs which);
+/* Firmware and board config file names the user chose, for drivers that take them; NULL for
+ * the driver's own choice */
+void kc_firmware_set_choice(const char *firmware, const char *boardfile);
+const char *kc_firmware_choice(void);
+const char *kc_firmware_board_choice(void);
 
 /* Misc */
 #define kallsyms_lookup_name(n) 0

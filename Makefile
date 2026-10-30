@@ -148,6 +148,19 @@ RTW88_OBJS = \
 	drivers/rtw88/rtw8723d_table.o \
 	drivers/rtw88/rtw8723du.o
 
+# Morse Micro MM8108 802.11ah, from Kismet's libmm8108, with mac80211 glue
+MM8108_OBJS = \
+	drivers/mm8108/mm8108.o \
+	drivers/mm8108/mm_usb.o \
+	drivers/mm8108/mm_hw.o \
+	drivers/mm8108/mm_fw.o \
+	drivers/mm8108/mm_yaps.o \
+	drivers/mm8108/mm_cmd.o \
+	drivers/mm8108/mm_channels.o \
+	drivers/mm8108/mm_channel_tables.o \
+	drivers/mm8108/mm_s1g.o \
+	drivers/mm8108/mac.o
+
 GLUE_OBJS = \
 	drivers/mt76_glue.o
 
@@ -167,7 +180,7 @@ HWSIM_OBJS = \
 TOOL_CFLAGS = -DUWIFI_HWSIM
 endif
 
-ALL_OBJS = $(KCOMPAT_OBJS) $(MAC80211_OBJS) $(MT76_OBJS) $(RTW88_OBJS) $(GLUE_OBJS) $(COMMON_OBJS) \
+ALL_OBJS = $(KCOMPAT_OBJS) $(MAC80211_OBJS) $(MT76_OBJS) $(RTW88_OBJS) $(MM8108_OBJS) $(GLUE_OBJS) $(COMMON_OBJS) \
 	$(HWSIM_OBJS) tools/uwifi.o
 
 # Drivers register from constructors, so the whole archive is linked
@@ -179,7 +192,7 @@ endif
 
 all: $(TOOL)
 
-$(LIB): $(KCOMPAT_OBJS) $(MAC80211_OBJS) $(MT76_OBJS) $(RTW88_OBJS) $(GLUE_OBJS) $(COMMON_OBJS) $(HWSIM_OBJS)
+$(LIB): $(KCOMPAT_OBJS) $(MAC80211_OBJS) $(MT76_OBJS) $(RTW88_OBJS) $(MM8108_OBJS) $(GLUE_OBJS) $(COMMON_OBJS) $(HWSIM_OBJS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
