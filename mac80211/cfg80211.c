@@ -21,7 +21,9 @@
  * Frequency conversion, header length and the HT/VHT bitrates are from Linux
  * net/wireless/util.c (GPL-2.0,
  * Copyright 2007-2009 Johannes Berg, 2013 Intel Mobile Communications GmbH, 2017 Intel
- * Deutschland GmbH, 2018-2023 Intel Corporation).  There is no regulatory database: the
+ * Deutschland GmbH, 2018-2023 Intel Corporation), and nl80211_chan_width_to_mhz() from
+ * net/wireless/chan.c (GPL-2.0, Copyright 2009 Johannes Berg, 2018-2026 Intel
+ * Corporation).  There is no regulatory database: the
  * firmware enforces its own limits and every channel the driver lists is usable. */
 
 #include "local.h"
@@ -434,4 +436,48 @@ int cfg80211_get_ies_channel_number(const u8 *ie, size_t ielen, enum nl80211_ban
 /* NAN interfaces are never created */
 void cfg80211_next_nan_dw_notif(struct wireless_dev *wdev, struct ieee80211_channel *chan, gfp_t gfp) {
     (void) wdev; (void) chan; (void) gfp;
+}
+
+int nl80211_chan_width_to_mhz(enum nl80211_chan_width chan_width)
+{
+	int mhz;
+
+	switch (chan_width) {
+	case NL80211_CHAN_WIDTH_1:
+		mhz = 1;
+		break;
+	case NL80211_CHAN_WIDTH_2:
+		mhz = 2;
+		break;
+	case NL80211_CHAN_WIDTH_4:
+		mhz = 4;
+		break;
+	case NL80211_CHAN_WIDTH_8:
+		mhz = 8;
+		break;
+	case NL80211_CHAN_WIDTH_16:
+		mhz = 16;
+		break;
+	case NL80211_CHAN_WIDTH_20:
+	case NL80211_CHAN_WIDTH_20_NOHT:
+		mhz = 20;
+		break;
+	case NL80211_CHAN_WIDTH_40:
+		mhz = 40;
+		break;
+	case NL80211_CHAN_WIDTH_80P80:
+	case NL80211_CHAN_WIDTH_80:
+		mhz = 80;
+		break;
+	case NL80211_CHAN_WIDTH_160:
+		mhz = 160;
+		break;
+	case NL80211_CHAN_WIDTH_320:
+		mhz = 320;
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		return -1;
+	}
+	return mhz;
 }

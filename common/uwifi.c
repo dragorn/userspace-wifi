@@ -655,3 +655,11 @@ int uwifi_set_chan(struct uwifi_dev *dev, const struct uwifi_chan *chan) {
 
     return kc_mac80211_set_chandef(dev->hw, &def);
 }
+
+int uwifi_tx(struct uwifi_dev *dev, const u8 *data, size_t len) {
+    return kc_mac80211_tx(dev->hw, data, len);
+}
+
+void uwifi_set_tx_status_cb(struct uwifi_dev *dev, kc_mac80211_tx_status_cb_t cb, void *ctx) {
+    kc_mac80211_set_tx_status_cb(dev->hw, cb, ctx);
+}

@@ -26,7 +26,6 @@
 #include "pcap.h"
 
 #define PCAP_SNAPLEN 65535
-#define PCAP_DLT_IEEE802_11_RADIO 127
 
 struct uwifi_pcap {
     FILE *f;
@@ -68,7 +67,7 @@ struct uwifi_pcap *uwifi_pcap_open(const char *path) {
     put_le32(hdr + 8, 0);
     put_le32(hdr + 12, 0);
     put_le32(hdr + 16, PCAP_SNAPLEN);
-    put_le32(hdr + 20, PCAP_DLT_IEEE802_11_RADIO);
+    put_le32(hdr + 20, UWIFI_DLT_IEEE802_11_RADIO);
 
     if (fwrite(hdr, sizeof(hdr), 1, p->f) != 1 || fflush(p->f) != 0) {
         fclose(p->f);
@@ -110,4 +109,69 @@ void uwifi_pcap_close(struct uwifi_pcap *p) {
         fclose(p->f);
     pthread_mutex_destroy(&p->lock);
     free(p);
+}
+
+struct uwifi_pcap_reader {
+    FILE *f;
+    bool swapped;
+    uint8_t *buf;
+};
+
+static uint32_t get_u32(const uint8_t *p, bool swapped) {
+    return swapped ? (uint32_t) p[0] << 24 | (uint32_t) p[1] << 16 | (uint32_t) p[2] << 8 | p[3] :
+        (uint32_t) p[3] << 24 | (uint32_t) p[2] << 16 | (uint32_t) p[1] << 8 | p[0];
+}
+
+struct uwifi_pcap_reader *uwifi_pcap_read_open(const char *path, uint32_t *linktype) {
+    struct uwifi_pcap_reader *r;
+    uint8_t hdr[24];
+    uint32_t magic;
+
+    if ((r = calloc(1, sizeof(*r))) == NULL)
+        return NULL;
+
+    if ((r->f = fopen(path, "rb")) == NULL || fread(hdr, sizeof(hdr), 1, r->f) != 1)
+        goto fail;
+
+    magic = get_u32(hdr, false);
+    if (magic == 0xd4c3b2a1 || magic == 0x4d3cb2a1)
+        r->swapped = true;
+    else if (magic != 0xa1b2c3d4 && magic != 0xa1b23c4d)
+        goto fail;
+
+    *linktype = get_u32(hdr + 20, r->swapped) & 0xffff;
+
+    if ((r->buf = malloc(PCAP_SNAPLEN)) == NULL)
+        goto fail;
+
+    return r;
+
+fail:
+    if (r->f)
+        fclose(r->f);
+    free(r);
+    return NULL;
+}
+
+int uwifi_pcap_read_next(struct uwifi_pcap_reader *r, const uint8_t **data) {
+    uint8_t rec[16];
+    uint32_t caplen;
+
+    if (fread(rec, sizeof(rec), 1, r->f) != 1)
+        return feof(r->f) ? 0 : -1;
+
+    caplen = get_u32(rec + 8, r->swapped);
+    if (caplen == 0 || caplen > PCAP_SNAPLEN || fread(r->buf, caplen, 1, r->f) != 1)
+        return -1;
+
+    *data = r->buf;
+    return (int) caplen;
+}
+
+void uwifi_pcap_read_close(struct uwifi_pcap_reader *r) {
+    if (r == NULL)
+        return;
+    fclose(r->f);
+    free(r->buf);
+    free(r);
 }

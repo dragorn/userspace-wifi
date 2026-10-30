@@ -17,7 +17,7 @@
 */
 
 /* hw allocation and registration, monitor bring-up, channel contexts and the mac80211
- * calls a monitor-only driver makes.  Station, TX, scan and power-save paths are inert:
+ * calls a monitor-only driver makes.  Station, scan and power-save paths are inert:
  * no station or data interface ever exists. */
 
 #include "local.h"
@@ -81,6 +81,7 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len, const struct ie
     }
 
     INIT_WORK(&local->restart_work, kc_restart_work);
+    kc_mac80211_tx_init(local);
     INIT_LIST_HEAD(&local->list);
     return &local->hw;
 }
@@ -213,6 +214,20 @@ int kc_mac80211_set_regdomain(struct ieee80211_hw *hw, const char *alpha2) {
 }
 
 /* Work queued by the driver runs on the hw's ordered workqueue */
+struct ieee80211_local *kc_vif_to_local(struct ieee80211_vif *vif) {
+    struct ieee80211_local *local, *found = NULL;
+
+    pthread_mutex_lock(&kc_locals_lock);
+    list_for_each_entry(local, &kc_locals, list) {
+        if (local->monitor_vif == vif) {
+            found = local;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&kc_locals_lock);
+    return found;
+}
+
 void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) {
     queue_work(hw_to_local(hw)->workqueue, work);
 }
@@ -501,6 +516,7 @@ void kc_mac80211_stop(struct ieee80211_hw *hw) {
 
     hw->conf.flags &= ~IEEE80211_CONF_MONITOR;
     local->ops->stop(hw, false);
+    kc_mac80211_tx_flush(local);
     local->started = false;
     local->open_count = 0;
     local->rx_cb = NULL;
@@ -529,8 +545,6 @@ int kc_mac80211_chandef(struct ieee80211_hw *hw, enum nl80211_band band, int cha
 }
 
 /* Calls a monitor-only device makes which have nothing to act on */
-void ieee80211_stop_queues(struct ieee80211_hw *hw) { (void) hw; }
-void ieee80211_wake_queues(struct ieee80211_hw *hw) { (void) hw; }
 void ieee80211_txq_schedule_start(struct ieee80211_hw *hw, u8 ac) { (void) hw; (void) ac; }
 void __ieee80211_schedule_txq(struct ieee80211_hw *hw, struct ieee80211_txq *txq, bool force) {
     (void) hw; (void) txq; (void) force;
@@ -544,35 +558,12 @@ bool ieee80211_tx_prepare_skb(struct ieee80211_hw *hw, struct ieee80211_vif *vif
         int band, struct ieee80211_sta **sta) {
     (void) hw; (void) vif; (void) skb; (void) band; (void) sta; return false;
 }
-void ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb) { (void) hw; kfree_skb(skb); }
-void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) {
-    ieee80211_free_txskb(hw, skb);
-}
-void ieee80211_purge_tx_queue(struct ieee80211_hw *hw, struct sk_buff_head *skbs) {
-    struct sk_buff *skb;
-
-    while ((skb = __skb_dequeue(skbs)) != NULL)
-        ieee80211_free_txskb(hw, skb);
-}
 void ieee80211_txq_get_depth(struct ieee80211_txq *txq, unsigned long *frame_cnt, unsigned long *byte_cnt) {
     (void) txq;
     if (frame_cnt)
         *frame_cnt = 0;
     if (byte_cnt)
         *byte_cnt = 0;
-}
-void ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status) {
-    (void) hw;
-    if (status->skb)
-        kfree_skb(status->skb);
-}
-void ieee80211_get_tx_rates(struct ieee80211_vif *vif, struct ieee80211_sta *sta, struct sk_buff *skb,
-        struct ieee80211_tx_rate *dest, int max_rates) {
-    (void) vif; (void) sta; (void) skb;
-    for (int i = 0; i < max_rates; i++) {
-        dest[i].idx = -1;
-        dest[i].count = 0;
-    }
 }
 struct sk_buff *ieee80211_nullfunc_get(struct ieee80211_hw *hw, struct ieee80211_vif *vif, int link_id,
         bool qos_ok) {

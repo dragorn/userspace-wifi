@@ -16,8 +16,8 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-/* Userspace USB Wi-Fi tool: list adapters, show capabilities, and capture in monitor
- * mode while hopping channels, with packet counts and a pcap. */
+/* Userspace USB Wi-Fi tool: list adapters, show capabilities, capture in monitor mode
+ * while hopping channels, with packet counts and a pcap, and inject frames. */
 
 #include <getopt.h>
 #include <signal.h>
@@ -50,6 +50,15 @@ struct capture {
     unsigned long pcap_errors;
 };
 
+struct inject {
+    unsigned long sent;
+    unsigned long busy;
+    unsigned long status;
+    unsigned long acked;
+    unsigned long rx_frames;
+    struct uwifi_pcap *pcap;
+};
+
 static volatile sig_atomic_t stop_requested;
 
 /* Status output; stderr when the pcap is written to stdout */
@@ -66,10 +75,11 @@ static u64 now_ms(void) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "Usage: %s [options] list|info|capture\n"
+            "Usage: %s [options] list|info|capture|inject\n"
             "  list                  list supported USB Wi-Fi adapters\n"
             "  info                  load firmware and show bands, channels, rates and widths\n"
             "  capture               monitor mode with channel hopping\n"
+            "  inject                transmit frames on one channel (-c), counting ACKs\n"
             "Options:\n"
             "  -d, --device N        adapter index from 'list' (default 0)\n"
             "  -F, --fw-dir DIR      firmware directory (searched first)\n"
@@ -81,7 +91,13 @@ static void usage(const char *argv0) {
             "  -T, --duration S      stop after S seconds\n"
             "  -w, --pcap FILE       write radiotap pcap; '-' for stdout\n"
             "  -C, --country CC      regulatory country to report to the driver\n"
-            "  -v, --verbose         driver debug logging\n",
+            "  -v, --verbose         driver debug logging\n"
+            "Inject options:\n"
+            "  -n, --count N         frames to send (default 10; 0 to send until stopped)\n"
+            "  -i, --interval MS     time between frames (default 100)\n"
+            "  -a, --dest MAC        address probe requests to MAC, which ACKs them (default broadcast)\n"
+            "  -R, --rate RATE       legacy rate in Mbps (1, 6, 54...) or HT MCS as mcsN\n"
+            "  -r, --replay FILE     send the frames in an 802.11 or radiotap pcap instead\n",
             argv0, DEFAULT_DWELL_MS);
 }
 
@@ -275,6 +291,172 @@ static int run_hops(struct uwifi_dev *dev, struct capture *cap, unsigned long dw
     return 0;
 }
 
+static void inject_rx(void *ctx, struct ieee80211_hw *hw, const struct ieee80211_rx_status *status,
+        const u8 *data, size_t len) {
+    struct inject *inj = ctx;
+    (void) hw;
+    (void) status;
+
+    __atomic_add_fetch(&inj->rx_frames, 1, __ATOMIC_RELAXED);
+    if (inj->pcap)
+        uwifi_pcap_write(inj->pcap, data, len);
+}
+
+static void inject_status(void *ctx, struct ieee80211_hw *hw, const u8 *data, size_t len, bool acked) {
+    struct inject *inj = ctx;
+    (void) hw;
+    (void) data;
+    (void) len;
+
+    __atomic_add_fetch(&inj->status, 1, __ATOMIC_RELAXED);
+    if (acked)
+        __atomic_add_fetch(&inj->acked, 1, __ATOMIC_RELAXED);
+}
+
+static int parse_mac(const char *s, u8 *mac) {
+    unsigned int b[ETH_ALEN];
+
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != ETH_ALEN)
+        return -1;
+    for (int i = 0; i < ETH_ALEN; i++)
+        mac[i] = (u8) b[i];
+    return 0;
+}
+
+/* Radiotap for injection: a rate or HT MCS when given, and no ACK expected for broadcast */
+static size_t inject_radiotap(u8 *buf, const char *rate, bool noack) {
+    u32 present = BIT(IEEE80211_RADIOTAP_TX_FLAGS);
+    size_t len = 8;
+
+    if (rate && strncmp(rate, "mcs", 3) == 0) {
+        present |= BIT(IEEE80211_RADIOTAP_MCS);
+    } else if (rate) {
+        present |= BIT(IEEE80211_RADIOTAP_RATE);
+        buf[len++] = (u8) (atof(rate) * 2);
+    }
+
+    len = ALIGN(len, 2);
+    put_unaligned_le16(noack ? IEEE80211_RADIOTAP_F_TX_NOACK : 0, buf + len);
+    len += 2;
+
+    if (present & BIT(IEEE80211_RADIOTAP_MCS)) {
+        buf[len++] = IEEE80211_RADIOTAP_MCS_HAVE_MCS | IEEE80211_RADIOTAP_MCS_HAVE_BW;
+        buf[len++] = IEEE80211_RADIOTAP_MCS_BW_20;
+        buf[len++] = (u8) atoi(rate + 3);
+    }
+
+    buf[0] = 0;
+    buf[1] = 0;
+    put_unaligned_le16((u16) len, buf + 2);
+    put_unaligned_le32(present, buf + 4);
+    return len;
+}
+
+/* A probe request with the wildcard SSID */
+static size_t inject_probe_req(u8 *buf, const u8 *sa, const u8 *da, u16 seq) {
+    static const u8 rates[] = { WLAN_EID_SUPP_RATES, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
+    struct ieee80211_hdr_3addr *hdr = (struct ieee80211_hdr_3addr *) buf;
+    size_t len = sizeof(*hdr);
+
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_PROBE_REQ);
+    memcpy(hdr->addr1, da, ETH_ALEN);
+    memcpy(hdr->addr2, sa, ETH_ALEN);
+    memcpy(hdr->addr3, da, ETH_ALEN);
+    hdr->seq_ctrl = cpu_to_le16(seq << 4);
+
+    buf[len++] = WLAN_EID_SSID;
+    buf[len++] = 0;
+    memcpy(buf + len, rates, sizeof(rates));
+    return len + sizeof(rates);
+}
+
+/* Sends one frame, waiting while the driver's queues are full */
+static int inject_send(struct uwifi_dev *dev, struct inject *inj, const u8 *frame, size_t len) {
+    int r;
+
+    while ((r = uwifi_tx(dev, frame, len)) == -EBUSY && !stop_requested) {
+        inj->busy++;
+        msleep(2);
+    }
+
+    if (r == 0)
+        inj->sent++;
+    return r;
+}
+
+static int run_inject(struct uwifi_dev *dev, struct inject *inj, const char *replay, const char *dest,
+        const char *rate, unsigned long count, unsigned long interval_ms) {
+    const u64 start = now_ms();
+    u8 frame[4096];
+    u8 da[ETH_ALEN];
+    int r = 0;
+
+    eth_broadcast_addr(da);
+    if (dest && parse_mac(dest, da) < 0) {
+        fprintf(stderr, "invalid address '%s'\n", dest);
+        return 1;
+    }
+
+    if (replay) {
+        struct uwifi_pcap_reader *rd;
+        const u8 *pkt;
+        uint32_t linktype;
+        int len;
+
+        if ((rd = uwifi_pcap_read_open(replay, &linktype)) == NULL) {
+            fprintf(stderr, "could not read %s\n", replay);
+            return 1;
+        }
+        if (linktype != UWIFI_DLT_IEEE802_11 && linktype != UWIFI_DLT_IEEE802_11_RADIO) {
+            fprintf(stderr, "%s is not an 802.11 or radiotap pcap (link type %u)\n", replay, linktype);
+            uwifi_pcap_read_close(rd);
+            return 1;
+        }
+
+        while (!stop_requested && (count == 0 || inj->sent < count) && (len = uwifi_pcap_read_next(rd, &pkt)) > 0) {
+            size_t flen = 0;
+
+            if (linktype == UWIFI_DLT_IEEE802_11) {
+                flen = inject_radiotap(frame, rate, false);
+                if ((size_t) len > sizeof(frame) - flen)
+                    continue;
+            } else if ((size_t) len > sizeof(frame)) {
+                continue;
+            }
+            memcpy(frame + flen, pkt, (size_t) len);
+
+            if ((r = inject_send(dev, inj, frame, flen + (size_t) len)) < 0 && r != -EINVAL)
+                break;
+            if (interval_ms)
+                msleep(interval_ms);
+        }
+        uwifi_pcap_read_close(rd);
+    } else {
+        for (u16 seq = 0; !stop_requested && (count == 0 || inj->sent < count); seq = (seq + 1) & 0xfff) {
+            size_t rt = inject_radiotap(frame, rate, is_broadcast_ether_addr(da));
+            size_t len = rt + inject_probe_req(frame + rt, uwifi_mac(dev), da, seq);
+
+            if ((r = inject_send(dev, inj, frame, len)) < 0)
+                break;
+            if (interval_ms)
+                msleep(interval_ms);
+        }
+    }
+
+    /* Give the last frames time to be sent and reported */
+    msleep(500);
+
+    if (r < 0 && r != -EINVAL)
+        fprintf(stderr, "transmit failed: %s\n", r == -EPERM ? "channel does not permit transmit" :
+                strerror(-r));
+
+    fprintf(out, "sent %lu frames in %.1fs, %lu status reports, %lu acked, %lu waits for queue space; "
+            "received %lu frames\n", inj->sent, (now_ms() - start) / 1000.0, inj->status, inj->acked,
+            inj->busy, inj->rx_frames);
+    return r < 0 && r != -EINVAL ? 1 : 0;
+}
+
 int main(int argc, char *argv[]) {
     static const struct option longopts[] = {
         { "device", required_argument, NULL, 'd' },
@@ -288,10 +470,18 @@ int main(int argc, char *argv[]) {
         { "pcap", required_argument, NULL, 'w' },
         { "country", required_argument, NULL, 'C' },
         { "verbose", no_argument, NULL, 'v' },
+        { "count", required_argument, NULL, 'n' },
+        { "interval", required_argument, NULL, 'i' },
+        { "dest", required_argument, NULL, 'a' },
+        { "rate", required_argument, NULL, 'R' },
+        { "replay", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
     const char *fw_dir = NULL, *channels = NULL, *pcap_path = NULL, *country = NULL;
+    const char *dest = NULL, *rate = NULL, *replay = NULL;
+    unsigned long count = 10, interval_ms = 100;
+    struct inject inj = { 0 };
     unsigned int bands = (1u << NL80211_BAND_2GHZ) | (1u << NL80211_BAND_5GHZ) | (1u << NL80211_BAND_6GHZ);
     unsigned int widths = 1u << NL80211_CHAN_WIDTH_20;
     unsigned long dwell_ms = DEFAULT_DWELL_MS, duration_s = 0;
@@ -301,7 +491,7 @@ int main(int argc, char *argv[]) {
     struct capture cap = { 0 };
     struct uwifi_dev *dev;
 
-    while ((opt = getopt_long(argc, argv, "d:F:pc:b:W:t:T:w:C:vh", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:F:pc:b:W:t:T:w:C:vn:i:a:R:r:h", longopts, NULL)) != -1) {
         switch (opt) {
             case 'd': index = strtoul(optarg, NULL, 10); break;
             case 'F': fw_dir = optarg; break;
@@ -314,6 +504,11 @@ int main(int argc, char *argv[]) {
             case 'w': pcap_path = optarg; break;
             case 'C': country = optarg; break;
             case 'v': verbose++; break;
+            case 'n': count = strtoul(optarg, NULL, 10); break;
+            case 'i': interval_ms = strtoul(optarg, NULL, 10); break;
+            case 'a': dest = optarg; break;
+            case 'R': rate = optarg; break;
+            case 'r': replay = optarg; break;
             default:
                 usage(argv[0]);
                 return opt == 'h' ? 0 : 1;
@@ -343,7 +538,7 @@ int main(int argc, char *argv[]) {
     if (strcmp(cmd, "list") == 0)
         return cmd_list();
 
-    if (strcmp(cmd, "info") != 0 && strcmp(cmd, "capture") != 0) {
+    if (strcmp(cmd, "info") != 0 && strcmp(cmd, "capture") != 0 && strcmp(cmd, "inject") != 0) {
         usage(argv[0]);
         return 1;
     }
@@ -361,6 +556,35 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(cmd, "info") == 0 && !probe) {
         ret = 0;
+        goto out;
+    }
+
+    if (strcmp(cmd, "inject") == 0) {
+        struct uwifi_chan chan;
+
+        if (channels == NULL || strchr(channels, ',') || uwifi_parse_chan(dev, channels, &chan) < 0) {
+            fprintf(stderr, "inject needs one channel supported by this adapter (-c)\n");
+            goto out;
+        }
+        if (pcap_path && (inj.pcap = uwifi_pcap_open(pcap_path)) == NULL) {
+            fprintf(stderr, "could not open %s\n", pcap_path);
+            goto out;
+        }
+
+        uwifi_set_tx_status_cb(dev, inject_status, &inj);
+        if (uwifi_start_monitor(dev, inject_rx, &inj) < 0) {
+            fprintf(stderr, "could not enter monitor mode\n");
+            goto out;
+        }
+        if (country && kc_mac80211_set_regdomain(uwifi_hw(dev), country) < 0)
+            fprintf(stderr, "invalid country '%s'\n", country);
+        if (uwifi_set_chan(dev, &chan) < 0) {
+            fprintf(stderr, "could not tune %s\n", chan.name);
+            goto out;
+        }
+
+        fprintf(out, "\nInjecting on %s\n", chan.name);
+        ret = run_inject(dev, &inj, replay, dest, rate, count, interval_ms);
         goto out;
     }
 
@@ -396,6 +620,7 @@ int main(int argc, char *argv[]) {
 out:
     uwifi_close(dev);
     uwifi_pcap_close(cap.pcap);
+    uwifi_pcap_close(inj.pcap);
     free(cap.hops);
     return ret;
 }

@@ -19,7 +19,7 @@
 #ifndef __UWIFI_PCAP_H__
 #define __UWIFI_PCAP_H__
 
-/* Minimal radiotap pcap writer; safe to call from the receive thread */
+/* Minimal radiotap pcap writer, safe to call from the receive thread, and reader */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -31,5 +31,17 @@ struct uwifi_pcap *uwifi_pcap_open(const char *path);
 /* Returns 0, or -1 if the write failed */
 int uwifi_pcap_write(struct uwifi_pcap *p, const uint8_t *data, size_t len);
 void uwifi_pcap_close(struct uwifi_pcap *p);
+
+#define UWIFI_DLT_IEEE802_11 105
+#define UWIFI_DLT_IEEE802_11_RADIO 127
+
+struct uwifi_pcap_reader;
+
+/* Opens a pcap of either byte order and microsecond or nanosecond timestamps */
+struct uwifi_pcap_reader *uwifi_pcap_read_open(const char *path, uint32_t *linktype);
+/* Returns the packet length and points data at it until the next call; 0 at the end, -1
+ * for a truncated or corrupt file */
+int uwifi_pcap_read_next(struct uwifi_pcap_reader *r, const uint8_t **data);
+void uwifi_pcap_read_close(struct uwifi_pcap_reader *r);
 
 #endif

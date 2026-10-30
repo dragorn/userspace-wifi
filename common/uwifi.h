@@ -90,6 +90,12 @@ int uwifi_hop_list(struct uwifi_dev *dev, unsigned int bands, unsigned int width
 int uwifi_start_monitor(struct uwifi_dev *dev, kc_mac80211_rx_cb_t cb, void *ctx);
 int uwifi_set_chan(struct uwifi_dev *dev, const struct uwifi_chan *chan);
 
+/* Transmits on the current channel once monitoring: a radiotap header and 802.11 frame, as
+ * written to a Linux monitor interface; see kc_mac80211_tx() */
+int uwifi_tx(struct uwifi_dev *dev, const u8 *data, size_t len);
+/* Reports whether each transmitted frame was acknowledged */
+void uwifi_set_tx_status_cb(struct uwifi_dev *dev, kc_mac80211_tx_status_cb_t cb, void *ctx);
+
 static inline const char *uwifi_band_name(enum nl80211_band b) {
     return b == NL80211_BAND_2GHZ ? "2.4GHz" : b == NL80211_BAND_5GHZ ? "5GHz" :
         b == NL80211_BAND_6GHZ ? "6GHz" : "other";

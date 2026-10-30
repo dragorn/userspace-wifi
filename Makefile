@@ -50,7 +50,9 @@ KCOMPAT_OBJS = \
 MAC80211_OBJS = \
 	mac80211/main.o \
 	mac80211/rx.o \
-	mac80211/cfg80211.o
+	mac80211/tx.o \
+	mac80211/cfg80211.o \
+	kcompat/upstream/radiotap.o
 
 MT76_OBJS = \
 	drivers/mt76/mac80211.o \
@@ -201,6 +203,9 @@ drivers/mt76/%.o: drivers/mt76/%.c
 
 drivers/rtw88/%.o: drivers/rtw88/%.c
 	$(CC) $(RTW88_CFLAGS) -c $< -o $@
+
+kcompat/upstream/%.o: kcompat/upstream/%.c
+	$(CC) $(KC_CFLAGS) -w -c $< -o $@
 
 %.o: %.c
 	$(CC) $(OWN_CFLAGS) -c $< -o $@

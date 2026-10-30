@@ -19,12 +19,14 @@
 #ifndef __KC_MAC80211_H__
 #define __KC_MAC80211_H__
 
-/* Minimal mac80211 for unmodified Linux Wi-Fi drivers, for monitor-mode capture.
+/* Minimal mac80211 for unmodified Linux Wi-Fi drivers, for monitor-mode capture and
+ * injection.
  *
  * Drivers allocate and register an ieee80211_hw as usual.  The host program finds the
  * registered hw for a probed device, then brings up a monitor interface and changes
  * channels; the calls into the driver follow mac80211's order for a monitor interface.
- * Received frames are delivered with a radiotap header built as mac80211 builds it. */
+ * Received frames are delivered with a radiotap header built as mac80211 builds it, and
+ * frames are injected with one, as on a Linux monitor interface. */
 
 #include <net/mac80211.h>
 
@@ -38,9 +40,21 @@ struct ieee80211_hw *kc_mac80211_wait_hw(struct device *parent, unsigned int tim
 /* Sets the regulatory country the driver is notified of; "00" is the world domain */
 int kc_mac80211_set_regdomain(struct ieee80211_hw *hw, const char *alpha2);
 
+/* Status of an injected frame: data is the 802.11 frame, valid only during the call */
+typedef void (*kc_mac80211_tx_status_cb_t)(void *ctx, struct ieee80211_hw *hw, const u8 *data, size_t len,
+        bool acked);
+
 int kc_mac80211_start_monitor(struct ieee80211_hw *hw, kc_mac80211_rx_cb_t cb, void *ctx);
 int kc_mac80211_set_chandef(struct ieee80211_hw *hw, const struct cfg80211_chan_def *def);
 void kc_mac80211_stop(struct ieee80211_hw *hw);
+
+/* Injects a frame on the current channel: a radiotap header followed by the 802.11 frame,
+ * as written to a Linux monitor interface.  Radiotap flags, TX flags, rate, MCS, VHT, data
+ * retries and antenna are honoured as mac80211 honours them.  Returns 0 once queued,
+ * -EBUSY while the driver's queues are full, -EPERM where the channel forbids transmit
+ * (no-IR or radar), -EINVAL for a malformed frame. */
+int kc_mac80211_tx(struct ieee80211_hw *hw, const u8 *data, size_t len);
+void kc_mac80211_set_tx_status_cb(struct ieee80211_hw *hw, kc_mac80211_tx_status_cb_t cb, void *ctx);
 
 /* For chips which DMA the FCS after some frames but report a length without it; a valid
  * FCS found there is kept on the frame and flagged in radiotap */

@@ -47,6 +47,15 @@ struct ieee80211_local {
     kc_mac80211_rx_cb_t rx_cb;
     void *rx_ctx;
 
+    kc_mac80211_tx_status_cb_t tx_status_cb;
+    void *tx_status_ctx;
+
+    /* Stopped queues, as a bitmap, and frames held until the driver wakes them */
+    spinlock_t queue_stop_reason_lock;
+    unsigned long queue_stop_reasons;
+    struct sk_buff_head pending;
+    struct work_struct tx_pending_work;
+
     /* The chip leaves the FCS just past some frames; see kc_mac80211_set_rx_fcs_past_end() */
     bool rx_fcs_past_end;
 
@@ -70,7 +79,15 @@ ieee80211_have_rx_timestamp(struct ieee80211_rx_status *status)
 	return status->flag & RX_FLAG_MACTIME;
 }
 
+/* The local whose monitor interface vif is; NULL for an unknown vif */
+struct ieee80211_local *kc_vif_to_local(struct ieee80211_vif *vif);
+
 /* rx.c */
 void kc_mac80211_deliver(struct ieee80211_local *local, struct sk_buff *skb);
+
+/* tx.c */
+void kc_mac80211_tx_init(struct ieee80211_local *local);
+/* Drops held frames and clears stopped queues, once the driver is stopped */
+void kc_mac80211_tx_flush(struct ieee80211_local *local);
 
 #endif
