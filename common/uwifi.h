@@ -42,8 +42,12 @@ struct uwifi_dev_info {
     const char *speed;
 };
 
-/* Firmware directories are searched in order for driver firmware paths */
+/* Firmware directories are searched in order for driver firmware paths, then on Linux the
+ * system firmware directories */
 int uwifi_init(const char *const *fw_paths, size_t n_paths, int log_level);
+/* Firmware and board config file names to load instead of the driver's choice, for drivers
+ * that take them (mm8108); NULL for the driver's own.  Set before opening an adapter. */
+void uwifi_set_firmware_choice(const char *firmware, const char *boardfile);
 
 /* Sends driver log messages to cb instead of stderr */
 void uwifi_set_log_cb(void (*cb)(void *ctx, int level, const char *msg), void *ctx);

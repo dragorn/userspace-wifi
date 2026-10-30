@@ -36,6 +36,10 @@
 #define DEFAULT_DWELL_MS 500
 #define PROBE_DWELL_MS 200
 
+/* Long options without a short form */
+#define OPT_FIRMWARE 256
+#define OPT_BOARDFILE 257
+
 struct hop_stats {
     struct uwifi_chan chan;
     unsigned long frames;
@@ -93,6 +97,8 @@ static void usage(const char *argv0) {
             "Options:\n"
             "  -d, --device N        adapter index from 'list' (default 0)\n"
             "  -F, --fw-dir DIR      firmware directory (searched first)\n"
+            "      --firmware NAME   mm8108: firmware file to load instead of the chip's own\n"
+            "      --boardfile NAME  mm8108: board config file to load instead of the board type's\n"
             "  -p, --probe-channels  with info: tune every channel and width and report results\n"
             "  -c, --channels LIST   channels to hop, e.g. 1,6,11,36VHT80,6g:37HE80\n"
             "  -b, --bands LIST      bands to hop, from 2,5,6 (default all)\n"
@@ -474,6 +480,12 @@ static int run_inject(struct uwifi_dev *dev, struct inject *inj, const char *rep
     return r < 0 && r != -EINVAL ? 1 : 0;
 }
 
+/* A bare file name, so a chosen file can't come from outside the firmware directories */
+static bool firmware_name_valid(const char *name) {
+    return name[0] != 0 && strchr(name, '/') == NULL && strchr(name, '\\') == NULL &&
+        strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+}
+
 int main(int argc, char *argv[]) {
     static const struct option longopts[] = {
         { "device", required_argument, NULL, 'd' },
@@ -493,11 +505,14 @@ int main(int argc, char *argv[]) {
         { "rate", required_argument, NULL, 'R' },
         { "replay", required_argument, NULL, 'r' },
         { "name", required_argument, NULL, 'N' },
+        { "firmware", required_argument, NULL, OPT_FIRMWARE },
+        { "boardfile", required_argument, NULL, OPT_BOARDFILE },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
     const char *fw_dir = NULL, *channels = NULL, *pcap_path = NULL, *country = NULL;
     const char *dest = NULL, *rate = NULL, *replay = NULL, *name = NULL;
+    const char *fw_name = NULL, *bcf_name = NULL;
     unsigned long count = 10, interval_ms = 100;
     struct inject inj = { 0 };
     unsigned int bands = (1u << NL80211_BAND_2GHZ) | (1u << NL80211_BAND_5GHZ) | (1u << NL80211_BAND_6GHZ);
@@ -528,6 +543,8 @@ int main(int argc, char *argv[]) {
             case 'R': rate = optarg; break;
             case 'r': replay = optarg; break;
             case 'N': name = optarg; break;
+            case OPT_FIRMWARE: fw_name = optarg; break;
+            case OPT_BOARDFILE: bcf_name = optarg; break;
             default:
                 usage(argv[0]);
                 return opt == 'h' ? 0 : 1;
@@ -548,10 +565,17 @@ int main(int argc, char *argv[]) {
     out = (pcap_path && strcmp(pcap_path, "-") == 0) ? stderr : stdout;
     /* A closed pipe ends the capture instead of killing the process */
     signal(SIGPIPE, SIG_IGN);
-    const char *fw_paths[] = { fw_dir, "firmware", FIRMWAREDIR, "/usr/local/share/kismet/firmware", "/usr/share/kismet/firmware",
-        "/lib/firmware" };
+    const char *fw_paths[] = { fw_dir, "firmware", FIRMWAREDIR, "/usr/local/share/kismet/firmware",
+        "/usr/share/kismet/firmware" };
     const char *const *paths = fw_dir ? fw_paths : fw_paths + 1;
     size_t n_paths = fw_dir ? ARRAY_SIZE(fw_paths) : ARRAY_SIZE(fw_paths) - 1;
+
+    if ((fw_name && !firmware_name_valid(fw_name)) || (bcf_name && !firmware_name_valid(bcf_name))) {
+        fprintf(stderr, "--firmware and --boardfile take a file name in the firmware directories, "
+                "not a path\n");
+        return 1;
+    }
+    uwifi_set_firmware_choice(fw_name, bcf_name);
 
     if (uwifi_init(paths, n_paths, verbose ? 7 : 4) < 0) {
         fprintf(stderr, "could not initialize USB\n");

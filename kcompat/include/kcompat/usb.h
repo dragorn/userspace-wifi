@@ -336,8 +336,11 @@ static inline void usb_fill_bulk_urb(struct urb *urb, struct usb_device *dev, un
     urb->dev = dev; urb->pipe = pipe; urb->transfer_buffer = buf;
     urb->transfer_buffer_length = (u32) len; urb->complete = complete; urb->context = context;
 }
-#define usb_fill_int_urb(urb, dev, pipe, buf, len, complete, context, interval) \
-    do { usb_fill_bulk_urb(urb, dev, pipe, buf, len, complete, context); (urb)->interval = (interval); } while (0)
+static inline void usb_fill_int_urb(struct urb *urb, struct usb_device *dev, unsigned int pipe,
+        void *buf, int len, usb_complete_t complete, void *context, int interval) {
+    usb_fill_bulk_urb(urb, dev, pipe, buf, len, complete, context);
+    urb->interval = interval;
+}
 
 /* Host side, used by the tool and capture code */
 struct kc_usb_probe_entry {

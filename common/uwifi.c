@@ -65,6 +65,10 @@ int uwifi_init(const char *const *fw_paths, size_t n_paths, int log_level) {
     return kc_usb_init();
 }
 
+void uwifi_set_firmware_choice(const char *firmware, const char *boardfile) {
+    kc_firmware_set_choice(firmware, boardfile);
+}
+
 static const char *uwifi_speed_name(int speed) {
     switch (speed) {
         case USB_SPEED_LOW:
@@ -428,6 +432,8 @@ void uwifi_print_caps(struct uwifi_dev *dev, FILE *out) {
                 fprintf(out, " %sMHz", wnames[w]);
         fprintf(out, "\n");
     }
+
+    kc_mac80211_print_chanmap(dev->hw, out);
 }
 
 /* Channel specs */

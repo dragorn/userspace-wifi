@@ -527,6 +527,15 @@ void kc_mac80211_set_rx_fcs_past_end(struct ieee80211_hw *hw) {
     hw_to_local(hw)->rx_fcs_past_end = true;
 }
 
+void kc_mac80211_set_chanmap_cb(struct ieee80211_hw *hw, kc_mac80211_chanmap_cb_t cb) {
+    hw_to_local(hw)->chanmap_cb = cb;
+}
+
+void kc_mac80211_print_chanmap(struct ieee80211_hw *hw, FILE *out) {
+    if (hw_to_local(hw)->chanmap_cb)
+        hw_to_local(hw)->chanmap_cb(hw, out);
+}
+
 /* Builds radiotap in front of the frame and hands it to the monitor callback */
 void kc_mac80211_deliver(struct ieee80211_local *local, struct sk_buff *skb) {
     struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);

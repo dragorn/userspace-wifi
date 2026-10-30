@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <kcompat/kcompat.h>
@@ -338,24 +339,107 @@ void *idr_get_next(const struct idr *idr, int *nextid) {
     return NULL;
 }
 
-/* Firmware: name is a relative path such as "mediatek/WIFI_RAM_CODE_MT7961_1.bin" */
-#define KC_FW_MAX_PATHS 16
+/* Firmware: name is a relative path such as "mediatek/WIFI_RAM_CODE_MT7961_1.bin".  The host
+ * program's directories come first, then the system's. */
+#define KC_FW_MAX_PATHS 24
 #define KC_FW_MAX_SIZE (16 * 1024 * 1024)
+#define KC_FW_PATH_LEN 256
 static char *kc_fw_paths[KC_FW_MAX_PATHS];
-static size_t kc_fw_npaths;
+static size_t kc_fw_npaths, kc_fw_nhost;
+static char *kc_fw_choice, *kc_fw_board_choice;
+
+static void kc_firmware_add_path(const char *path) {
+    if (kc_fw_npaths < KC_FW_MAX_PATHS && (kc_fw_paths[kc_fw_npaths] = strdup(path)) != NULL)
+        kc_fw_npaths++;
+}
+
+/* As the Linux kernel's firmware loader searches them: the firmware_class.path parameter,
+ * /lib/firmware/updates/<release>, /lib/firmware/updates, /lib/firmware/<release>, then
+ * /lib/firmware */
+static void kc_firmware_add_system_paths(void) {
+#ifdef __linux__
+    char custom[KC_FW_PATH_LEN * 2], path[KC_FW_PATH_LEN + 64];
+    struct utsname un;
+    bool release = false;
+    FILE *f;
+
+    /* A release with a path separator can't be part of a directory name */
+    if (uname(&un) == 0 && un.release[0] != 0 && strchr(un.release, '/') == NULL &&
+            strcmp(un.release, "..") != 0 && strcmp(un.release, ".") != 0)
+        release = true;
+
+    /* Set on the kernel command line or by the distribution; empty if unset */
+    if ((f = fopen("/sys/module/firmware_class/parameters/path", "r")) != NULL) {
+        if (fgets(custom, sizeof(custom), f) != NULL) {
+            custom[strcspn(custom, "\n")] = 0;
+            if (custom[0] == '/' && strlen(custom) < KC_FW_PATH_LEN && strstr(custom, "..") == NULL)
+                kc_firmware_add_path(custom);
+        }
+        fclose(f);
+    }
+
+    if (release) {
+        snprintf(path, sizeof(path), "/lib/firmware/updates/%s", un.release);
+        kc_firmware_add_path(path);
+    }
+    kc_firmware_add_path("/lib/firmware/updates");
+    if (release) {
+        snprintf(path, sizeof(path), "/lib/firmware/%s", un.release);
+        kc_firmware_add_path(path);
+    }
+    kc_firmware_add_path("/lib/firmware");
+#endif
+}
 
 void kc_firmware_set_paths(const char *const *paths, size_t n) {
     for (size_t i = 0; i < kc_fw_npaths; i++)
         free(kc_fw_paths[i]);
     kc_fw_npaths = 0;
 
-    for (size_t i = 0; i < n && kc_fw_npaths < KC_FW_MAX_PATHS; i++)
-        if (paths[i] != NULL && (kc_fw_paths[kc_fw_npaths] = strdup(paths[i])) != NULL)
-            kc_fw_npaths++;
+    for (size_t i = 0; i < n; i++)
+        if (paths[i] != NULL)
+            kc_firmware_add_path(paths[i]);
+    kc_fw_nhost = kc_fw_npaths;
+
+    kc_firmware_add_system_paths();
 }
 
-/* Each directory in turn, as named and then in each compressed form */
-int request_firmware(const struct firmware **fwp, const char *name, struct device *dev) {
+size_t kc_firmware_get_paths(enum kc_fw_dirs which, const char *const **paths) {
+    *paths = (const char *const *) kc_fw_paths + (which == KC_FW_DIRS_SYSTEM ? kc_fw_nhost : 0);
+
+    switch (which) {
+        case KC_FW_DIRS_HOST:
+            return kc_fw_nhost;
+        case KC_FW_DIRS_SYSTEM:
+            return kc_fw_npaths - kc_fw_nhost;
+        default:
+            return kc_fw_npaths;
+    }
+}
+
+static void kc_set_name(char **dst, const char *name) {
+    free(*dst);
+    *dst = name != NULL ? strdup(name) : NULL;
+}
+
+void kc_firmware_set_choice(const char *firmware, const char *boardfile) {
+    kc_set_name(&kc_fw_choice, firmware);
+    kc_set_name(&kc_fw_board_choice, boardfile);
+}
+
+const char *kc_firmware_choice(void) {
+    return kc_fw_choice;
+}
+
+const char *kc_firmware_board_choice(void) {
+    return kc_fw_board_choice;
+}
+
+/* Each directory in turn, each name in it, as named and then in each compressed form */
+static int kc_request_firmware_names(const struct firmware **fwp, const char *const *names,
+        size_t num_names, struct device *dev, bool warn, enum kc_fw_dirs which) {
+    const char *const *paths;
+    const size_t npaths = kc_firmware_get_paths(which, &paths);
     const char *suffixes[FW_FILE_MAX_SUFFIXES];
     size_t num_suffixes = fw_file_suffixes(suffixes);
     struct firmware *fw;
@@ -364,38 +448,61 @@ int request_firmware(const struct firmware **fwp, const char *name, struct devic
     *fwp = NULL;
 
     /* No absolute paths or parent references from drivers */
-    if (name == NULL || name[0] == '/' || strstr(name, "..") != NULL)
-        return -EINVAL;
+    for (size_t i = 0; i < num_names; i++)
+        if (names[i] == NULL || names[i][0] == '/' || strstr(names[i], "..") != NULL)
+            return -EINVAL;
 
     if ((fw = calloc(1, sizeof(*fw))) == NULL)
         return -ENOMEM;
 
-    for (size_t i = 0; i < kc_fw_npaths; i++) {
-        for (size_t s = 0; s < num_suffixes; s++) {
-            uint8_t *data;
-            size_t len;
-            int n, r;
+    for (size_t i = 0; i < npaths; i++) {
+        for (size_t f = 0; f < num_names; f++) {
+            for (size_t s = 0; s < num_suffixes; s++) {
+                uint8_t *data;
+                size_t len;
+                int n, r;
 
-            n = snprintf(path, sizeof(path), "%s/%s%s", kc_fw_paths[i], name, suffixes[s]);
-            if (n < 0 || (size_t) n >= sizeof(path))
-                continue;
+                n = snprintf(path, sizeof(path), "%s/%s%s", paths[i], names[f], suffixes[s]);
+                if (n < 0 || (size_t) n >= sizeof(path))
+                    continue;
 
-            if ((r = fw_file_read(path, KC_FW_MAX_SIZE, &data, &len)) == 0) {
-                fw->data = data;
-                fw->size = len;
-                dev_dbg(dev, "loaded firmware %s (%zu bytes)", path, fw->size);
-                *fwp = fw;
-                return 0;
+                if ((r = fw_file_read(path, KC_FW_MAX_SIZE, &data, &len)) == 0) {
+                    fw->data = data;
+                    fw->size = len;
+                    dev_dbg(dev, "loaded firmware %s (%zu bytes)", path, fw->size);
+                    *fwp = fw;
+                    return 0;
+                }
+
+                if (r != -ENOENT)
+                    dev_err(dev, "could not load firmware %s: %s", path, strerror(-r));
             }
-
-            if (r != -ENOENT)
-                dev_err(dev, "could not load firmware %s: %s", path, strerror(-r));
         }
     }
 
-    dev_err(dev, "firmware %s not found", name);
+    if (warn)
+        dev_err(dev, "firmware %s not found", names[0]);
     free(fw);
     return -ENOENT;
+}
+
+static int kc_request_firmware(const struct firmware **fwp, const char *name, struct device *dev,
+        bool warn, enum kc_fw_dirs which) {
+    return kc_request_firmware_names(fwp, &name, 1, dev, warn, which);
+}
+
+int request_firmware(const struct firmware **fwp, const char *name, struct device *dev) {
+    return kc_request_firmware(fwp, name, dev, true, KC_FW_DIRS_ALL);
+}
+
+/* For optional files, such as one of several candidates */
+int firmware_request_nowarn(const struct firmware **fwp, const char *name, struct device *dev) {
+    return kc_request_firmware(fwp, name, dev, false, KC_FW_DIRS_ALL);
+}
+
+int kc_firmware_request_in(const struct firmware **fwp, const char *const *names, size_t num_names,
+        struct device *dev, enum kc_fw_dirs which) {
+    return kc_request_firmware_names(fwp, names, num_names, dev, false, which);
 }
 
 int request_firmware_nowait(struct module *module, bool uevent, const char *name, struct device *dev,

@@ -30,6 +30,14 @@
 #define CHANNEL_POLL_MS 250
 #define TX_CHANNEL_HOLD_MS 400
 
+/* Until the radio has an operating channel the adapter hops its own channels this often, and
+ * the beacons and probe responses it hears are replayed to the radio, which takes those on
+ * whichever channel it is scanning: a passive scan sends nothing to follow */
+#define IDLE_HOP_MS 300
+#define BSS_REPLAY_MS 20
+#define BSS_CACHE_MAX 32
+#define BSS_CACHE_AGE_MS 30000
+
 /* mac80211_hwsim's legacy rates; 5 and 6GHz start at 6 Mbps */
 static const u16 hwsim_bitrates[] = { 10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540 };
 #define HWSIM_OFDM_OFFSET 4
@@ -44,6 +52,17 @@ struct tx_pending {
     u64 sent_ms;
     bool driver_status;
     bool acked;
+};
+
+struct bss_entry {
+    u8 bssid[ETH_ALEN];
+    u32 freq;
+    __le16 fc;
+    u32 rx_rate;
+    s32 signal;
+    u64 seen_ms;
+    size_t len;
+    u8 *frame;
 };
 
 struct hwsim_bridge {
@@ -63,6 +82,14 @@ struct hwsim_bridge {
     enum nl80211_chan_width width;
     u32 center_freq1;
     u64 last_tx_other_ms;
+    u64 last_tx_ms;
+
+    /* No operating channel: hop and replay (see IDLE_HOP_MS) */
+    bool connected;
+    u32 *hop_freqs;
+    size_t n_hops, hop_idx;
+    u64 next_hop_ms, next_replay_ms;
+    struct bss_entry bss[BSS_CACHE_MAX];
 
     pthread_mutex_t lock;
     struct tx_pending pending[TX_PENDING_MAX];
@@ -277,6 +304,7 @@ static void bridge_frame_from_radio(struct hwsim_bridge *b, const struct uwifi_g
     memcpy(buf + rt, frame->data, frame->len);
 
     p.sent_ms = kc_jiffies_now();
+    b->last_tx_ms = p.sent_ms;
 
     /* Register before sending, so a quick status finds it */
     if (!noack) {
@@ -356,6 +384,119 @@ static u32 bridge_rx_rate(struct hwsim_bridge *b, const struct ieee80211_rx_stat
     return 0;
 }
 
+/* The latest beacon and probe response of each BSS on each channel */
+static void bridge_cache_bss(struct hwsim_bridge *b, const struct ieee80211_hdr *hdr, size_t len, u32 freq,
+        u32 rx_rate, s32 signal) {
+    struct bss_entry *e = NULL, *oldest = &b->bss[0];
+    u64 now = kc_jiffies_now();
+    u8 *copy;
+
+    if ((copy = malloc(len)) == NULL)
+        return;
+    memcpy(copy, hdr, len);
+
+    pthread_mutex_lock(&b->lock);
+    for (size_t i = 0; i < BSS_CACHE_MAX && e == NULL; i++) {
+        struct bss_entry *c = &b->bss[i];
+
+        if (c->frame && c->freq == freq && c->fc == hdr->frame_control && ether_addr_equal(c->bssid, hdr->addr3))
+            e = c;
+        else if (c->frame == NULL || (oldest->frame && c->seen_ms < oldest->seen_ms))
+            oldest = c;
+    }
+    if (e == NULL)
+        e = oldest;
+
+    free(e->frame);
+    memcpy(e->bssid, hdr->addr3, ETH_ALEN);
+    e->freq = freq;
+    e->fc = hdr->frame_control;
+    e->rx_rate = rx_rate;
+    e->signal = signal;
+    e->seen_ms = now;
+    e->len = len;
+    e->frame = copy;
+    pthread_mutex_unlock(&b->lock);
+}
+
+static void bridge_replay_bss(struct hwsim_bridge *b, u64 now) {
+    struct uwifi_genl_msg *m = malloc(sizeof(*m));
+
+    if (m == NULL)
+        return;
+
+    pthread_mutex_lock(&b->lock);
+    for (size_t i = 0; i < BSS_CACHE_MAX; i++) {
+        struct bss_entry *e = &b->bss[i];
+
+        if (e->frame == NULL)
+            continue;
+
+        if (now - e->seen_ms >= BSS_CACHE_AGE_MS) {
+            free(e->frame);
+            e->frame = NULL;
+            continue;
+        }
+
+        uwifi_genl_msg_init(b->hwsim, m, HWSIM_CMD_FRAME, 0);
+        uwifi_genl_put(m, HWSIM_ATTR_ADDR_RECEIVER, b->mac, ETH_ALEN);
+        uwifi_genl_put(m, HWSIM_ATTR_FRAME, e->frame, e->len);
+        uwifi_genl_put_u32(m, HWSIM_ATTR_RX_RATE, e->rx_rate);
+        uwifi_genl_put_u32(m, HWSIM_ATTR_SIGNAL, (u32) e->signal);
+        uwifi_genl_put_u32(m, HWSIM_ATTR_FREQ, e->freq);
+        uwifi_genl_send(b->hwsim, m);
+    }
+    pthread_mutex_unlock(&b->lock);
+    free(m);
+}
+
+static void bridge_clear_bss(struct hwsim_bridge *b) {
+    pthread_mutex_lock(&b->lock);
+    for (size_t i = 0; i < BSS_CACHE_MAX; i++) {
+        free(b->bss[i].frame);
+        b->bss[i].frame = NULL;
+    }
+    pthread_mutex_unlock(&b->lock);
+}
+
+/* Every enabled 20MHz channel the adapter has */
+static void bridge_build_hops(struct hwsim_bridge *b) {
+    struct wiphy *wiphy = b->hw->wiphy;
+    size_t n = 0;
+
+    for (int band = 0; band < NUM_NL80211_BANDS; band++)
+        if (wiphy->bands[band])
+            n += wiphy->bands[band]->n_channels;
+
+    if ((b->hop_freqs = calloc(n ? n : 1, sizeof(*b->hop_freqs))) == NULL)
+        return;
+
+    for (int band = 0; band < NUM_NL80211_BANDS; band++) {
+        const struct ieee80211_supported_band *sband = wiphy->bands[band];
+
+        for (int c = 0; sband && c < sband->n_channels; c++)
+            if (!(sband->channels[c].flags & IEEE80211_CHAN_DISABLED))
+                b->hop_freqs[b->n_hops++] = sband->channels[c].center_freq;
+    }
+}
+
+static void bridge_idle(struct hwsim_bridge *b, u64 now) {
+    if (b->connected)
+        return;
+
+    if (now >= b->next_replay_ms) {
+        bridge_replay_bss(b, now);
+        b->next_replay_ms = now + BSS_REPLAY_MS;
+    }
+
+    /* Frames from the radio set the channel for a while */
+    if (b->n_hops && now >= b->next_hop_ms && now - b->last_tx_ms >= TX_CHANNEL_HOLD_MS) {
+        bridge_tune(b, b->hop_freqs[b->hop_idx], NL80211_CHAN_WIDTH_20, 0);
+        b->hop_idx = (b->hop_idx + 1) % b->n_hops;
+        b->next_hop_ms = now + IDLE_HOP_MS;
+    }
+}
+
 /* A frame the adapter received, passed to the radio */
 static void bridge_rx(void *ctx, struct ieee80211_hw *hw, const struct ieee80211_rx_status *status,
         const u8 *data, size_t len) {
@@ -406,11 +547,17 @@ static void bridge_rx(void *ctx, struct ieee80211_hw *hw, const struct ieee80211
     if ((m = malloc(sizeof(*m))) == NULL)
         return;
 
+    s32 signal = status->signal ? status->signal : -50;
+    u32 rx_rate = bridge_rx_rate(b, status);
+
+    if (ieee80211_is_beacon(hdr->frame_control) || ieee80211_is_probe_resp(hdr->frame_control))
+        bridge_cache_bss(b, hdr, len, status->freq, rx_rate, signal);
+
     uwifi_genl_msg_init(b->hwsim, m, HWSIM_CMD_FRAME, 0);
     uwifi_genl_put(m, HWSIM_ATTR_ADDR_RECEIVER, b->mac, ETH_ALEN);
     uwifi_genl_put(m, HWSIM_ATTR_FRAME, data, len);
-    uwifi_genl_put_u32(m, HWSIM_ATTR_RX_RATE, bridge_rx_rate(b, status));
-    uwifi_genl_put_u32(m, HWSIM_ATTR_SIGNAL, (u32) (int) (status->signal ? status->signal : -50));
+    uwifi_genl_put_u32(m, HWSIM_ATTR_RX_RATE, rx_rate);
+    uwifi_genl_put_u32(m, HWSIM_ATTR_SIGNAL, (u32) signal);
     uwifi_genl_put_u32(m, HWSIM_ATTR_FREQ, status->freq);
     if (uwifi_genl_send(b->hwsim, m) == 0)
         __atomic_add_fetch(&b->rx_frames, 1, __ATOMIC_RELAXED);
@@ -486,6 +633,10 @@ static void bridge_poll_channel(struct hwsim_bridge *b) {
     uwifi_genl_request(b->nl80211, m, true, bridge_iface_cb, &cp, NL80211_ATTR_MAX);
     free(m);
 
+    if (cp.freq && !b->connected)
+        bridge_clear_bss(b);
+    b->connected = cp.freq != 0;
+
     if (cp.freq && kc_jiffies_now() - b->last_tx_other_ms >= TX_CHANNEL_HOLD_MS)
         bridge_tune(b, cp.freq, cp.width, cp.center_freq1);
 }
@@ -556,7 +707,9 @@ int uwifi_hwsim_run(struct uwifi_dev *dev, const struct uwifi_hwsim_opts *opts, 
         fprintf(stderr, "could not start the adapter: %s\n", strerror(-r));
         goto out;
     }
-    bridge_tune(b, 2412, NL80211_CHAN_WIDTH_20, 0);
+    bridge_build_hops(b);
+    if (b->n_hops)
+        bridge_tune(b, b->hop_freqs[0], NL80211_CHAN_WIDTH_20, 0);
 
     /* Frames to the radio are acknowledged by the adapter, which sends them on its own */
     if ((r = kc_mac80211_add_station_vif(b->hw, b->mac)) < 0)
@@ -598,6 +751,7 @@ int uwifi_hwsim_run(struct uwifi_dev *dev, const struct uwifi_hwsim_opts *opts, 
 
         now = kc_jiffies_now();
         bridge_resolve(b, now);
+        bridge_idle(b, now);
 
         if (now >= next_poll) {
             bridge_poll_channel(b);
@@ -622,7 +776,9 @@ out:
     kc_mac80211_stop(b->hw);
     uwifi_genl_close(b->hwsim);
     uwifi_genl_close(b->nl80211);
+    bridge_clear_bss(b);
     pthread_mutex_destroy(&b->lock);
+    free(b->hop_freqs);
     free(b);
     return r;
 }
