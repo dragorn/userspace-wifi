@@ -42,6 +42,9 @@ struct ieee80211_local {
     struct ieee80211_chanctx_conf *chanctx;
     struct cfg80211_chan_def default_chandef;
 
+    /* kc_mac80211_add_station_vif() */
+    struct ieee80211_vif *station_vif;
+
     char alpha2[3];
 
     kc_mac80211_rx_cb_t rx_cb;

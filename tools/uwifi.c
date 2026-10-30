@@ -24,6 +24,9 @@
 
 #include "common/pcap.h"
 #include "common/uwifi.h"
+#ifdef UWIFI_HWSIM
+#include "hwsim/hwsim.h"
+#endif
 
 #ifndef FIRMWAREDIR
 #define FIRMWAREDIR "/usr/local/share/uwifi/firmware"
@@ -75,11 +78,18 @@ static u64 now_ms(void) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
+#ifdef UWIFI_HWSIM
+            "Usage: %s [options] list|info|capture|inject|hwsim\n"
+#else
             "Usage: %s [options] list|info|capture|inject\n"
+#endif
             "  list                  list supported USB Wi-Fi adapters\n"
             "  info                  load firmware and show bands, channels, rates and widths\n"
             "  capture               monitor mode with channel hopping\n"
             "  inject                transmit frames on one channel (-c), counting ACKs\n"
+#ifdef UWIFI_HWSIM
+            "  hwsim                 run the adapter as a Linux Wi-Fi device through mac80211_hwsim\n"
+#endif
             "Options:\n"
             "  -d, --device N        adapter index from 'list' (default 0)\n"
             "  -F, --fw-dir DIR      firmware directory (searched first)\n"
@@ -97,7 +107,14 @@ static void usage(const char *argv0) {
             "  -i, --interval MS     time between frames (default 100)\n"
             "  -a, --dest MAC        address probe requests to MAC, which ACKs them (default broadcast)\n"
             "  -R, --rate RATE       legacy rate in Mbps (1, 6, 54...) or HT MCS as mcsN\n"
-            "  -r, --replay FILE     send the frames in an 802.11 or radiotap pcap instead\n",
+            "  -r, --replay FILE     send the frames in an 802.11 or radiotap pcap instead\n"
+#ifdef UWIFI_HWSIM
+            "hwsim options:\n"
+            "  -N, --name NAME       wiphy name for the radio (default the adapter's interface name)\n"
+            "  -C, --country CC      also sets the radio's regulatory hint\n"
+            "  -T, --duration S      status line interval (default 10; 0 for none)\n"
+#endif
+            ,
             argv0, DEFAULT_DWELL_MS);
 }
 
@@ -475,11 +492,12 @@ int main(int argc, char *argv[]) {
         { "dest", required_argument, NULL, 'a' },
         { "rate", required_argument, NULL, 'R' },
         { "replay", required_argument, NULL, 'r' },
+        { "name", required_argument, NULL, 'N' },
         { "help", no_argument, NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
     const char *fw_dir = NULL, *channels = NULL, *pcap_path = NULL, *country = NULL;
-    const char *dest = NULL, *rate = NULL, *replay = NULL;
+    const char *dest = NULL, *rate = NULL, *replay = NULL, *name = NULL;
     unsigned long count = 10, interval_ms = 100;
     struct inject inj = { 0 };
     unsigned int bands = (1u << NL80211_BAND_2GHZ) | (1u << NL80211_BAND_5GHZ) | (1u << NL80211_BAND_6GHZ);
@@ -491,7 +509,7 @@ int main(int argc, char *argv[]) {
     struct capture cap = { 0 };
     struct uwifi_dev *dev;
 
-    while ((opt = getopt_long(argc, argv, "d:F:pc:b:W:t:T:w:C:vn:i:a:R:r:h", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:F:pc:b:W:t:T:w:C:vn:i:a:R:r:N:h", longopts, NULL)) != -1) {
         switch (opt) {
             case 'd': index = strtoul(optarg, NULL, 10); break;
             case 'F': fw_dir = optarg; break;
@@ -509,6 +527,7 @@ int main(int argc, char *argv[]) {
             case 'a': dest = optarg; break;
             case 'R': rate = optarg; break;
             case 'r': replay = optarg; break;
+            case 'N': name = optarg; break;
             default:
                 usage(argv[0]);
                 return opt == 'h' ? 0 : 1;
@@ -519,6 +538,10 @@ int main(int argc, char *argv[]) {
         usage(argv[0]);
         return 1;
     }
+
+#ifndef UWIFI_HWSIM
+    (void) name;
+#endif
 
     const char *cmd = argv[optind];
 
@@ -538,7 +561,11 @@ int main(int argc, char *argv[]) {
     if (strcmp(cmd, "list") == 0)
         return cmd_list();
 
-    if (strcmp(cmd, "info") != 0 && strcmp(cmd, "capture") != 0 && strcmp(cmd, "inject") != 0) {
+    if (strcmp(cmd, "info") != 0 && strcmp(cmd, "capture") != 0 && strcmp(cmd, "inject") != 0
+#ifdef UWIFI_HWSIM
+            && strcmp(cmd, "hwsim") != 0
+#endif
+            ) {
         usage(argv[0]);
         return 1;
     }
@@ -558,6 +585,21 @@ int main(int argc, char *argv[]) {
         ret = 0;
         goto out;
     }
+
+#ifdef UWIFI_HWSIM
+    if (strcmp(cmd, "hwsim") == 0) {
+        struct uwifi_hwsim_opts opts = {
+            .name = name,
+            .country = country,
+            .stats_interval_s = duration_s ? (unsigned int) duration_s : 10,
+        };
+
+        if (country && kc_mac80211_set_regdomain(uwifi_hw(dev), country) < 0)
+            fprintf(stderr, "invalid country '%s'\n", country);
+        ret = uwifi_hwsim_run(dev, &opts, &stop_requested, out) < 0;
+        goto out;
+    }
+#endif
 
     if (strcmp(cmd, "inject") == 0) {
         struct uwifi_chan chan;

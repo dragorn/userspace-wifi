@@ -94,8 +94,19 @@ static void uwifi_ifname_prefix(const char *driver, char *out, size_t len) {
     snprintf(out, len, "%.*s", (int) n, driver);
 }
 
-static void uwifi_fill_info(const struct kc_usb_probe_entry *e, struct uwifi_dev_info *info) {
+/* Adapters are indexed per driver, in path order */
+static void uwifi_fill_info(struct kc_usb_probe_entry **arr, size_t index, struct uwifi_dev_info *info) {
+    const struct kc_usb_probe_entry *e = arr[index];
+    char prefix[32];
+    int idx = 0;
+
+    for (size_t j = 0; j < index; j++)
+        if (arr[j]->driver == e->driver)
+            idx++;
+
     memset(info, 0, sizeof(*info));
+    uwifi_ifname_prefix(e->driver->name, prefix, sizeof(prefix));
+    snprintf(info->ifname, sizeof(info->ifname), "%s-%d", prefix, idx);
     snprintf(info->driver, sizeof(info->driver), "%s", e->driver->name);
     info->vid = e->vid;
     info->pid = e->pid;
@@ -158,20 +169,7 @@ int uwifi_list(struct uwifi_dev_info **list, size_t *n) {
     }
 
     for (size_t i = 0; i < *n; i++)
-        uwifi_fill_info(arr[i], &(*list)[i]);
-
-    /* Index adapters per driver, in path order */
-    for (size_t i = 0; i < *n; i++) {
-        char prefix[32];
-        int idx = 0;
-
-        uwifi_ifname_prefix((*list)[i].driver, prefix, sizeof(prefix));
-        for (size_t j = 0; j < i; j++)
-            if (strcmp((*list)[j].driver, (*list)[i].driver) == 0)
-                idx++;
-
-        snprintf((*list)[i].ifname, sizeof((*list)[i].ifname), "%s-%d", prefix, idx);
-    }
+        uwifi_fill_info(arr, i, &(*list)[i]);
 
     free(arr);
     kc_usb_free_probe(probe);
@@ -200,7 +198,7 @@ struct uwifi_dev *uwifi_open(size_t index, unsigned int timeout_ms) {
         return NULL;
     }
 
-    uwifi_fill_info(arr[index], &dev->info);
+    uwifi_fill_info(arr, index, &dev->info);
     r = kc_usb_probe_device(arr[index], &dev->intf);
     free(arr);
     kc_usb_free_probe(probe);

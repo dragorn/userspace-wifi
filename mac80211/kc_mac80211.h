@@ -48,6 +48,10 @@ int kc_mac80211_start_monitor(struct ieee80211_hw *hw, kc_mac80211_rx_cb_t cb, v
 int kc_mac80211_set_chandef(struct ieee80211_hw *hw, const struct cfg80211_chan_def *def);
 void kc_mac80211_stop(struct ieee80211_hw *hw);
 
+/* Adds a station interface with addr beside the monitor, joined to no BSS, so the hardware
+ * acknowledges frames sent to addr, as an active monitor does; it's removed on stop */
+int kc_mac80211_add_station_vif(struct ieee80211_hw *hw, const u8 *addr);
+
 /* Injects a frame on the current channel: a radiotap header followed by the 802.11 frame,
  * as written to a Linux monitor interface.  Radiotap flags, TX flags, rate, MCS, VHT, data
  * retries and antenna are honoured as mac80211 honours them.  Returns 0 once queued,

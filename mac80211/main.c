@@ -17,8 +17,9 @@
 */
 
 /* hw allocation and registration, monitor bring-up, channel contexts and the mac80211
- * calls a monitor-only driver makes.  Station, scan and power-save paths are inert:
- * no station or data interface ever exists. */
+ * calls a monitor-only driver makes.  Station, scan and power-save paths are inert: no
+ * station joins a BSS.  A station interface may be added beside the monitor so the hardware
+ * acknowledges frames to its address, as an active monitor would. */
 
 #include "local.h"
 
@@ -301,6 +302,36 @@ int ieee80211_emulate_switch_vif_chanctx(struct ieee80211_hw *hw, struct ieee802
 #define KC_MONITOR_FIF (FIF_ALLMULTI | FIF_FCSFAIL | FIF_PLCPFAIL | FIF_CONTROL | FIF_OTHER_BSS | \
         FIF_PSPOLL | FIF_PROBE_REQ | FIF_BCN_PRBRESP_PROMISC)
 
+static struct ieee80211_vif *kc_alloc_vif(struct ieee80211_hw *hw, enum nl80211_iftype type, const u8 *addr) {
+    struct ieee80211_vif *vif;
+
+    if ((vif = calloc(1, sizeof(*vif) + (size_t) hw->vif_data_size)) == NULL)
+        return NULL;
+
+    vif->type = type;
+    memcpy(vif->addr, addr, ETH_ALEN);
+    vif->addr_valid = true;
+    vif->bss_conf.vif = vif;
+    rcu_assign_pointer(vif->link_conf[0], &vif->bss_conf);
+    for (int ac = 0; ac < IEEE80211_NUM_ACS; ac++)
+        vif->hw_queue[ac] = (u8) ac;
+    vif->cab_queue = IEEE80211_INVAL_HW_QUEUE;
+
+    if ((vif->txq = calloc(1, sizeof(*vif->txq) + (size_t) hw->txq_data_size)) == NULL) {
+        free(vif);
+        return NULL;
+    }
+    vif->txq->vif = vif;
+    vif->txq->tid = IEEE80211_NUM_TIDS;
+    vif->txq->ac = IEEE80211_AC_BE;
+    return vif;
+}
+
+static void kc_free_vif(struct ieee80211_vif *vif) {
+    free(vif->txq);
+    free(vif);
+}
+
 /* Monitor interface bring-up, in the order mac80211's ieee80211_do_open() uses */
 int kc_mac80211_start_monitor(struct ieee80211_hw *hw, kc_mac80211_rx_cb_t cb, void *ctx) {
     struct ieee80211_local *local = hw_to_local(hw);
@@ -336,33 +367,15 @@ int kc_mac80211_start_monitor(struct ieee80211_hw *hw, kc_mac80211_rx_cb_t cb, v
         dev_warn(&hw->wiphy->dev, "initial config failed: %d", r);
 
     /* ieee80211_add_virtual_monitor() */
-    if ((vif = calloc(1, sizeof(*vif) + (size_t) hw->vif_data_size)) == NULL)
+    if ((vif = kc_alloc_vif(hw, NL80211_IFTYPE_MONITOR, hw->wiphy->perm_addr)) == NULL)
         return -ENOMEM;
-
-    vif->type = NL80211_IFTYPE_MONITOR;
-    memcpy(vif->addr, hw->wiphy->perm_addr, ETH_ALEN);
-    vif->addr_valid = true;
-    vif->bss_conf.vif = vif;
-    rcu_assign_pointer(vif->link_conf[0], &vif->bss_conf);
-    for (int ac = 0; ac < IEEE80211_NUM_ACS; ac++)
-        vif->hw_queue[ac] = (u8) ac;
-    vif->cab_queue = IEEE80211_INVAL_HW_QUEUE;
-
-    if ((vif->txq = calloc(1, sizeof(*vif->txq) + (size_t) hw->txq_data_size)) == NULL) {
-        free(vif);
-        return -ENOMEM;
-    }
-    vif->txq->vif = vif;
-    vif->txq->tid = IEEE80211_NUM_TIDS;
-    vif->txq->ac = IEEE80211_AC_BE;
 
     local->monitor_in_driver = ieee80211_hw_check(hw, WANT_MONITOR_VIF) ||
         ieee80211_hw_check(hw, NO_VIRTUAL_MONITOR);
 
     if (local->monitor_in_driver && (r = local->ops->add_interface(hw, vif)) < 0) {
         dev_err(&hw->wiphy->dev, "add monitor interface failed: %d", r);
-        free(vif->txq);
-        free(vif);
+        kc_free_vif(vif);
         return r;
     }
     local->monitor_vif = vif;
@@ -401,6 +414,44 @@ int kc_mac80211_start_monitor(struct ieee80211_hw *hw, kc_mac80211_rx_cb_t cb, v
         dev_warn(&hw->wiphy->dev, "monitor config failed: %d", r);
 
     return 0;
+}
+
+int kc_mac80211_add_station_vif(struct ieee80211_hw *hw, const u8 *addr) {
+    struct ieee80211_local *local = hw_to_local(hw);
+    struct ieee80211_vif *vif;
+    int r;
+
+    guard(mutex)(&hw->wiphy->mtx);
+
+    if (!local->started)
+        return -ENETDOWN;
+    if (local->station_vif)
+        return -EBUSY;
+
+    if ((vif = kc_alloc_vif(hw, NL80211_IFTYPE_STATION, addr)) == NULL)
+        return -ENOMEM;
+
+    /* ieee80211_do_open() for a station; it joins no BSS, so no channel is assigned */
+    if ((r = local->ops->add_interface(hw, vif)) < 0) {
+        dev_err(&hw->wiphy->dev, "add station interface failed: %d", r);
+        kc_free_vif(vif);
+        return r;
+    }
+
+    local->station_vif = vif;
+    return 0;
+}
+
+static void kc_remove_station_vif(struct ieee80211_local *local) {
+    struct ieee80211_vif *vif = local->station_vif;
+
+    if (vif == NULL)
+        return;
+
+    local->ops->remove_interface(&local->hw, vif);
+    local->station_vif = NULL;
+    synchronize_rcu();
+    kc_free_vif(vif);
 }
 
 /* ieee80211_reconfig() after ieee80211_restart_hw(): the driver lost its state, so the
@@ -446,6 +497,9 @@ static void kc_restart_work(struct work_struct *work) {
     }
 
     local->ops->configure_filter(hw, total_flags, &total_flags, 0);
+
+    if (local->station_vif && (r = local->ops->add_interface(hw, local->station_vif)) < 0)
+        dev_err(&hw->wiphy->dev, "add station interface after restart failed: %d", r);
 
     if (local->ops->reconfig_complete)
         local->ops->reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
@@ -494,6 +548,8 @@ void kc_mac80211_stop(struct ieee80211_hw *hw) {
     if (!local->started)
         return;
 
+    kc_remove_station_vif(local);
+
     if (vif) {
         if (local->chanctx) {
             if (local->monitor_in_driver && local->ops->unassign_vif_chanctx)
@@ -510,8 +566,7 @@ void kc_mac80211_stop(struct ieee80211_hw *hw) {
         local->monitor_vif = NULL;
         local->monitor_in_driver = false;
         synchronize_rcu();
-        free(vif->txq);
-        free(vif);
+        kc_free_vif(vif);
     }
 
     hw->conf.flags &= ~IEEE80211_CONF_MONITOR;

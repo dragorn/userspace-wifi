@@ -159,8 +159,16 @@ COMMON_OBJS = \
 LIB = libuwifi.a
 TOOL = uwifi
 
+# The adapter as a Linux Wi-Fi device through mac80211_hwsim
+ifeq ($(shell uname -s),Linux)
+HWSIM_OBJS = \
+	hwsim/genl.o \
+	hwsim/hwsim.o
+TOOL_CFLAGS = -DUWIFI_HWSIM
+endif
+
 ALL_OBJS = $(KCOMPAT_OBJS) $(MAC80211_OBJS) $(MT76_OBJS) $(RTW88_OBJS) $(GLUE_OBJS) $(COMMON_OBJS) \
-	tools/uwifi.o
+	$(HWSIM_OBJS) tools/uwifi.o
 
 # Drivers register from constructors, so the whole archive is linked
 ifeq ($(shell uname -s),Darwin)
@@ -171,7 +179,7 @@ endif
 
 all: $(TOOL)
 
-$(LIB): $(KCOMPAT_OBJS) $(MAC80211_OBJS) $(MT76_OBJS) $(RTW88_OBJS) $(GLUE_OBJS) $(COMMON_OBJS)
+$(LIB): $(KCOMPAT_OBJS) $(MAC80211_OBJS) $(MT76_OBJS) $(RTW88_OBJS) $(GLUE_OBJS) $(COMMON_OBJS) $(HWSIM_OBJS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
@@ -179,7 +187,11 @@ $(TOOL): tools/uwifi.o $(LIB)
 	$(CC) $(LDFLAGS) -pthread -o $@ tools/uwifi.o $(WHOLE_ARCHIVE) $(LIBUSBLIBS) $(FIRMWARELIBS) -lm
 
 tools/uwifi.o: tools/uwifi.c
-	$(CC) $(OWN_CFLAGS) -DFIRMWAREDIR=\"$(FIRMWAREDIR)\" -c $< -o $@
+	$(CC) $(OWN_CFLAGS) $(TOOL_CFLAGS) -DFIRMWAREDIR=\"$(FIRMWAREDIR)\" -c $< -o $@
+
+# Netlink against the system's Linux headers rather than kcompat's
+hwsim/genl.o: hwsim/genl.c
+	$(CC) -std=gnu11 -pthread -MMD -MP -O2 -g -fPIE -Wall -Wextra $(CFLAGS) -c $< -o $@
 
 common/firmware_file.o: common/firmware_file.c
 	$(CC) $(OWN_CFLAGS) $(FW_CFLAGS) -c $< -o $@
